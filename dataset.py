@@ -13,6 +13,9 @@ import numpy as np
 from transformers import Wav2Vec2FeatureExtractor, AutoModel
 from datasets import Dataset
 
+ALARSO_1_ID = "59265af2c61444b39b3b180f4864015d"
+ALARSO_1_SECRET =  "fc04505b01b24981adc52984043161ab"
+
 ALARSO_2_ID = "bf8823d9c28949baada2054f948fd5f9"
 ALARSO_2_SECRET = "a8321197eab943de9458fcc266087f63"
 
@@ -29,11 +32,15 @@ class Embedder:
             "m-a-p/MERT-v1-330M", trust_remote_code=True
         )
 
-    def download_songs(self, artist_id: str,  song_urls: List[str]):
+    def embed_songs(self, artist_id: str,  song_urls: List[str], max_songs: int):
         os.makedirs("embeddings", exist_ok=True)
         if not self.reset and os.path.exists(f"embeddings/{artist_id}"): return
         os.makedirs(f"embeddings/{artist_id}", exist_ok=True)
-        for idx, url in tqdm(enumerate(song_urls), leave=False):
+        # Select random song_urls
+        if len(song_urls) > max_songs:
+            song_urls = np.random.choice(song_urls, max_songs, replace=False)
+        for idx, url in tqdm(enumerate(song_urls[:max_songs]), leave=False):
+            if url is None: continue
             file = requests.get(url).content
             song = self._downsample(file)
             song = self._to_array(song)
@@ -68,12 +75,13 @@ class Embedder:
             embedding.squeeze(0).transpose(0, 1),
             kernel_size=pool_size
         ).transpose(0, 1)
-        assert embedding.shape[1] == 5
+        assert embedding.shape[0] == 5
         return embedding
 
 
 class TooManyRequest(Exception):
-    pass
+    def __init__(self):
+        super().__init__()
 
 
 class Dataset:
@@ -84,8 +92,8 @@ class Dataset:
         url = "https://accounts.spotify.com/api/token"
         data = {
             "grant_type": "client_credentials",
-            "client_id": GPTUNES_ID,
-            "client_secret": GPTUNES_SECRET
+            "client_id": ALARSO_1_ID,
+            "client_secret": ALARSO_1_SECRET
         }
         response = requests.post(url, data=data)
         token_data = response.json()
@@ -125,6 +133,7 @@ class Dataset:
             r = self._request(url)
             i = r["items"]
             song_urls = [song["preview_url"] for song in i]
+            song_urls = [url for url in song_urls if url is not None]
 
         # Create node attributes
         node_attr =  {
@@ -209,7 +218,9 @@ class Dataset:
             if "song_urls" not in node[1].keys(): continue
             album_ids = node[1]["album_ids"]
             if len(album_ids) == 0: not_available += 1
-            album_downloader.download_songs(artist_id=node[0], song_urls=node[1]["song_urls"])
+            album_downloader.embed_songs(artist_id=node[0],
+                                         song_urls=node[1]["song_urls"],
+                                         max_songs=30)
 
         print(">>> prop not available:", not_available/len(self.nodes))
 
@@ -233,17 +244,23 @@ def main():
     args = parser.parse_args()
     reset = args.reset
     if reset:
-        for file in os.listdir("data"): os.remove("data/"+file)
+        ans = input("Are you sure you want to reset the data? (y/n)")
+        if ans == "y":
+            for file in os.listdir("data"): os.remove("data/"+file)
+        else:
+            print("Aborting")
 
     dataset = Dataset()
     dataset.load("data")
-    dataset.populate_graph('5K4W6rqBFWDnAN6FQUkS6x', n_nodes=40000)
-    # embedder = Embedder(reset=False)
-    # dataset.embed_tracks(embedder)
+    # dataset.populate_graph('5K4W6rqBFWDnAN6FQUkS6x', n_nodes=40000)
+    embedder = Embedder(reset=False)
+    dataset.embed_tracks(embedder)
 
     # TODO: pick a node at random to expand. Or maybe not, because the ordering
     # of the artists is used now, and then you will expand artists first that
     # were added earlier and they are closer to the start artist.
+
+    # TODO: only get the 3 latest albums?
 
     print(">>> number of artist nodes:", len(dataset.nodes))
 
