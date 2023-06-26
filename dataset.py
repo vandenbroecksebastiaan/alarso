@@ -1,10 +1,79 @@
-# node_index| node_attr
-# edge_index | edge_attr
-
 import requests
 from tqdm import tqdm
 import json
 import os
+from typing import List
+from pydub import AudioSegment
+import io
+import argparse
+
+import torch
+import numpy as np
+
+from transformers import Wav2Vec2FeatureExtractor, AutoModel
+from datasets import Dataset
+
+ALARSO_2_ID = "bf8823d9c28949baada2054f948fd5f9"
+ALARSO_2_SECRET = "a8321197eab943de9458fcc266087f63"
+
+GPTUNES_ID = "2b8eed681f1746e290fef8574c11d303"
+GPTUNES_SECRET = "ab4b4d88e5da41d29b3d987a7fa98a10"
+
+class Embedder:
+    def __init__(self, reset: bool):
+        self.reset = reset
+        self.model = AutoModel.from_pretrained(
+            "m-a-p/MERT-v1-330M", trust_remote_code=True
+        ).cuda()
+        self.processor = Wav2Vec2FeatureExtractor.from_pretrained(
+            "m-a-p/MERT-v1-330M", trust_remote_code=True
+        )
+
+    def download_songs(self, artist_id: str,  song_urls: List[str]):
+        os.makedirs("embeddings", exist_ok=True)
+        if not self.reset and os.path.exists(f"embeddings/{artist_id}"): return
+        os.makedirs(f"embeddings/{artist_id}", exist_ok=True)
+        for idx, url in tqdm(enumerate(song_urls), leave=False):
+            file = requests.get(url).content
+            song = self._downsample(file)
+            song = self._to_array(song)
+            embedding = self._gen_embedding(song)
+
+            path = f"embeddings/{artist_id}/{idx}.txt"
+            with open(path, "w") as f:
+                f.write(json.dumps(embedding.tolist()))
+
+    def _downsample(self, audio: bytes):
+        original_audio = AudioSegment.from_mp3(io.BytesIO(audio))
+        downsampled_audio = original_audio.set_frame_rate(24000)
+        return downsampled_audio
+
+    def _to_array(self, song: AudioSegment):
+        song = song.get_array_of_samples()
+        audio_array = np.array(song) / 32768
+        audio_array = np.vstack((audio_array, audio_array))
+        audio_array = audio_array.astype(np.float32)
+        return audio_array
+
+    def _gen_embedding(self, song: np.array):
+        song = song[0, :]
+        inputs = self.processor(song, sampling_rate=24000, return_tensors="pt")
+        inputs["input_values"] = inputs["input_values"].cuda()
+        inputs["attention_mask"] = inputs["attention_mask"].cuda()
+        with torch.no_grad():
+            outputs = self.model(**inputs, output_hidden_states=True)
+        embedding = outputs["last_hidden_state"]
+        pool_size = embedding.shape[1] // 5
+        embedding = torch.nn.functional.avg_pool1d(
+            embedding.squeeze(0).transpose(0, 1),
+            kernel_size=pool_size
+        ).transpose(0, 1)
+        assert embedding.shape[1] == 5
+        return embedding
+
+
+class TooManyRequest(Exception):
+    pass
 
 
 class Dataset:
@@ -15,17 +84,20 @@ class Dataset:
         url = "https://accounts.spotify.com/api/token"
         data = {
             "grant_type": "client_credentials",
-            "client_id": "59265af2c61444b39b3b180f4864015d",
-            "client_secret": "fc04505b01b24981adc52984043161ab"
+            "client_id": GPTUNES_ID,
+            "client_secret": GPTUNES_SECRET
         }
         response = requests.post(url, data=data)
         token_data = response.json()
         access_token = token_data["access_token"]
         self.headers = {"Authorization": f"Bearer {access_token}"}
 
+    def _request(self, url):
+        r = requests.get(url, headers=self.headers)
+        if r.status_code == 429: raise TooManyRequest()
+        return r.json()
+
     def add_node(self, node_id, node_attr):
-        # If the node is an artist and already in the graph, update the expanded
-        # attribute
         if node_id not in [i[0] for i in self.nodes]:
             self.nodes.append([node_id, node_attr])
 
@@ -33,99 +105,113 @@ class Dataset:
         if [from_node_id, to_node_id] not in [i[0] for i in self.edges]:
             self.edges.append([[from_node_id, to_node_id], edge_attr])
 
-    def expand_album(self, album_id, genres):
+    def get_artist_node_from_id(self, artist_id, expanded=True):
+        # Get artist information
+        url = f"https://api.spotify.com/v1/artists/{artist_id}"
+        r = self._request(url)
+        name = r["name"]
+        popularity = r["popularity"]
+        followers = r["followers"]["total"]
+        genres = r["genres"]
+        # Get the album ids
+        url = f"https://api.spotify.com/v1/artists/{artist_id}/albums"
+        r = self._request(url)
+        i = r["items"]
+        album_ids = [album["id"] for album in i]
+
+        # Get track urls here
+        for album_id in tqdm(album_ids, leave=False, desc="Get album"):
+            url = f"https://api.spotify.com/v1/albums/{album_id}/tracks"
+            r = self._request(url)
+            i = r["items"]
+            song_urls = [song["preview_url"] for song in i]
+
+        # Create node attributes
+        node_attr =  {
+            "name": name, "expanded": expanded, "type": "artist",
+            "popularity": popularity, "followers": followers, "genres": genres,
+            "album_ids": album_ids, "song_urls": song_urls
+        }
+        return artist_id, node_attr
+
+    def expand_album(self, album_id):
         # Get the album object
         url  = f"https://api.spotify.com/v1/albums/{album_id}"
-        album = requests.get(url, headers=self.headers).json()
+        album = self._request(url)
 
         album_artist_id = album["artists"][0]["id"]
-        title = album["name"]
-        release_date = album["release_date"]
-        popularity = album["popularity"]
-        total_tracks = album["total_tracks"]
-
-        artist_ids = [i["id"] for i in album["artists"]]
-
-        self.add_node(album_id, {"name": title, "type": "album",
-                                 "year": release_date, "popularity": popularity,
-                                 "n_tracks": total_tracks, "genres": genres})
-        for id in artist_ids: self.add_edge(album_id, id, {"type": "album_artist"})
 
         # Get the songs of the album
         url = f"https://api.spotify.com/v1/albums/{album_id}/tracks"
         response = requests.get(url, headers=self.headers).json()
         songs = response["items"]
 
+        song_urls = []
         for song in songs:
-            song_id = song["id"]
-            song_name = song["name"]
+            song_url = song["preview_url"]
+            if song_url is not None: song_urls.append(song_url)
+            # TODO: save the url of the song here so that you don't need to
+            # get in the album downloader class
             song_artists = song["artists"]
-            song_duration = song["duration_ms"]
-            n_available_markets = len(song["available_markets"])
-
-            self.add_node(song_id, {"name": song_name, "type": "song",
-                                    "duration": song_duration,
-                                    "n_markets": n_available_markets})
+            # Check for artists
             for artist in song_artists:
                 artist_id = artist["id"]
                 if artist_id != album_artist_id:
-                    artist_name = artist["name"]
-                    self.add_node(artist_id, {"name": artist_name, "type": "artist", "expanded": False})
-                    self.add_edge(album_id, artist_id, {"type": "album_artist"})
+                    if artist_id not in [i[0] for i in self.nodes]:
+                        artist_node = self.get_artist_node_from_id(artist_id, expanded=False)
+                        self.add_node(*artist_node)
+                    self.add_edge(artist_id, album_artist_id, {"type": "collaboration"})
+            # Change the album_artist node to include the song_url
 
-            self.add_edge(song_id, album_id, {"type": "song_album"})
+        return song_urls
 
-    def expand_artist(self, artist_name, n_followers=100000):
-        url = f"https://api.spotify.com/v1/search?q={artist_name}" \
-               "&type=artist&limit=1&include_external=audio"
-        r = requests.get(url, headers=self.headers).json()
-        i = r["artists"]["items"]
+    def expand_artist(self, artist_id, n_followers=500000):
+        # If the artist is alraady in the graph, check if it is expanded.
+        if artist_id in [i[0] for i in self.nodes]:
+            artist_node = [i for i in self.nodes if i[0] == artist_id][0]
+            if artist_node[1]["expanded"]:
+                return
+        # If it is not in the graph or expanded, add it
+        else:
+            artist_node = self.get_artist_node_from_id(artist_id)
+            self.add_node(*artist_node)
 
-        artist_id = i[0]["id"]
-        popularity = i[0]["popularity"]
-        followers = 0 if i[0]["followers"]["total"] is None else i[0]["followers"]["total"]
-        genres = i[0]["genres"]
-
-        if len(i) == 0:
-            print(f"--- Skipping artist {artist_name} with no items")
+        if artist_node[1]["followers"] < n_followers:
+            print(f"Skipping {artist_id} because of {n_followers} followers")
             return
 
-        if followers < n_followers:
-            print(f"--- Skipping artist: {artist_name} with {followers} followers")
-            return
+        song_urls = []
+        for album_id in artist_node[1]["album_ids"]:
+            print(f"Expanding albums of {album_id}", end="\r")
+            song_urls.extend(self.expand_album(album_id))
 
-        # This step will be skipped if the artist_id is already in the graph
-        self.nodes = [i for i in self.nodes if i[0] != artist_id]
-        self.add_node(artist_id, {"name": artist_name, "type": "artist",
-                                  "expanded": True, "popularity": popularity,
-                                  "followers": followers, "genres": genres})
+        for node in self.nodes:
+            if node[0] == artist_id:
+                node[1]["song_urls"] = song_urls
+                node[1]["expanded"] = True
 
-        # Get the albums of the artist
-        url = f"https://api.spotify.com/v1/artists/{artist_id}/albums"
-        r = requests.get(url, headers=self.headers)
-        r = r.json()
-        i = r["items"]
-        album_ids = [album["id"] for album in i]
-
-        for id in album_ids: self.expand_album(id, genres)
-
-        # Set expanded to True
-        for n in self.nodes:
-            if n[0] == artist_id:
-                n[1]["expanded"] = True
-
-    def populate_graph(self, start_artist, n_nodes = 1000):
-        self.expand_artist(start_artist)
-        artist_nodes = [i for i in self.nodes if i[1]["type"] == "artist"
-                        and i[1]["expanded"] == False]
-        artist_names_to_expand = [i[1]["name"] for i in artist_nodes]
-        for i in tqdm(artist_names_to_expand, leave=False):
-            print(">>> expanded artist:", i)
+    def populate_graph(self, start_artist_id, n_nodes = 1000):
+        self.expand_artist(start_artist_id)
+        for node in tqdm(self.nodes, leave=False):
+            print(">>> expanded artist:", node[1]["name"])
             print(">>> number of nodes in graph:", len(self.nodes))
             print(">>> number of edges in graph:", len(self.edges))
-            self.expand_artist(i, n_followers=1000000)
+            self.expand_artist(node[0])
             self.save("data")
             if len(self.nodes) > n_nodes: break
+
+    def embed_tracks(self, album_downloader: Embedder):
+        """ Iterate over the nodes and download the tracks of the artist.
+        """
+        # artist/album/songs
+        not_available = 0
+        for node in tqdm(self.nodes, desc="Embedding tracks"):
+            if "song_urls" not in node[1].keys(): continue
+            album_ids = node[1]["album_ids"]
+            if len(album_ids) == 0: not_available += 1
+            album_downloader.download_songs(artist_id=node[0], song_urls=node[1]["song_urls"])
+
+        print(">>> prop not available:", not_available/len(self.nodes))
 
     def save(self, dir):
         with open(dir+"/nodes.txt", 'w') as f:
@@ -142,15 +228,24 @@ class Dataset:
                 self.edges = json.load(f)
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reset", action="store_true")
+    args = parser.parse_args()
+    reset = args.reset
+    if reset:
+        for file in os.listdir("data"): os.remove("data/"+file)
+
     dataset = Dataset()
     dataset.load("data")
-    dataset.populate_graph('Kanye West', n_nodes=40000)
+    dataset.populate_graph('5K4W6rqBFWDnAN6FQUkS6x', n_nodes=40000)
+    # embedder = Embedder(reset=False)
+    # dataset.embed_tracks(embedder)
 
-    # Add an embeddding from music2vec as a node attribute
+    # TODO: pick a node at random to expand. Or maybe not, because the ordering
+    # of the artists is used now, and then you will expand artists first that
+    # were added earlier and they are closer to the start artist.
 
-    print(">>> number of album nodes:", len([i for i in dataset.nodes if i[1]["type"] == "album"]))
-    print(">>> number of artist nodes:", len([i for i in dataset.nodes if i[1]["type"] == "artist"]))
-    print(">>> number of song nodes:", len([i for i in dataset.nodes if i[1]["type"] == "song"]))
+    print(">>> number of artist nodes:", len(dataset.nodes))
 
 
 if __name__ == "__main__":
