@@ -135,6 +135,10 @@ class Dataset:
             song_urls = [song["preview_url"] for song in i]
             song_urls = [url for url in song_urls if url is not None]
 
+        if len(album_ids) == 0:
+            album_ids = []
+            song_urls = []
+
         # Create node attributes
         node_attr =  {
             "name": name, "expanded": expanded, "type": "artist",
@@ -147,7 +151,6 @@ class Dataset:
         # Get the album object
         url  = f"https://api.spotify.com/v1/albums/{album_id}"
         album = self._request(url)
-
         album_artist_id = album["artists"][0]["id"]
 
         # Get the songs of the album
@@ -200,7 +203,8 @@ class Dataset:
                 node[1]["expanded"] = True
 
     def populate_graph(self, start_artist_id, n_nodes = 1000):
-        self.expand_artist(start_artist_id)
+        if start_artist_id not in [i[0] for i in self.nodes]:
+            self.expand_artist(start_artist_id)
         for node in tqdm(self.nodes, leave=False):
             print(">>> expanded artist:", node[1]["name"])
             print(">>> number of nodes in graph:", len(self.nodes))
@@ -252,15 +256,9 @@ def main():
 
     dataset = Dataset()
     dataset.load("data")
-    # dataset.populate_graph('5K4W6rqBFWDnAN6FQUkS6x', n_nodes=40000)
-    embedder = Embedder(reset=False)
-    dataset.embed_tracks(embedder)
-
-    # TODO: pick a node at random to expand. Or maybe not, because the ordering
-    # of the artists is used now, and then you will expand artists first that
-    # were added earlier and they are closer to the start artist.
-
-    # TODO: only get the 3 latest albums?
+    dataset.populate_graph('5K4W6rqBFWDnAN6FQUkS6x', n_nodes=40000)
+    # embedder = Embedder(reset=False)
+    # dataset.embed_tracks(embedder)
 
     print(">>> number of artist nodes:", len(dataset.nodes))
 
